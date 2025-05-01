@@ -2,10 +2,6 @@ const crypto = require("crypto");
 const axios = require("axios");
 require("dotenv").config();
 
-// متغير لتتبع عدد الرسائل المرسولة
-let sentCount = 0;
-const MAX_QUOTA = 10; // أقصى عدد مسموح به من الرسائل
-
 module.exports = async (req, res) => {
   try {
     // ------ التحقق من طريقة الطلب ------ //
@@ -22,46 +18,41 @@ module.exports = async (req, res) => {
       return res.status(401).json({ error: "Missing required headers" });
     }
 
-    // ------ قراءة ومعالجة البيانات ------ //
+    // ------ قراءة البيانات الخام ------ //
     const rawBody = await getRawBody(req);
 
-    // ------ التحقق من صحة التوقيع ------ //
+    // ------ التحقق من توقيع HMAC ------ //
     if (!verifyHmac(hmacHeader, rawBody)) {
       return res.status(401).json({ error: "Invalid HMAC signature" });
     }
 
+    // ------ معالجة البيانات ------ //
     const webhookData = JSON.parse(rawBody.toString("utf8"));
-
-    // ------ استخراج رقم الهاتف ------ //
     const phone = extractPhoneNumber(webhookData);
+
     if (!phone) {
       return res.status(400).json({ error: "Phone number not found" });
     }
 
-    // ------ التحقق من الحصة المتبقية ------ //
+    // ------ التحقق من الرصيد المتبقي ------ //
     const remainingQuota = await checkCredit();
     if (remainingQuota <= 0) {
       return res.status(402).json({ error: "SMS quota exceeded" });
     }
 
-    // ------ إنشاء الرسالة بناءً على الحدث ------ //
+    // ------ إنشاء الرسالة ------ //
     const message = createNotificationMessage(eventType, webhookData);
     if (!message) {
       return res.status(400).json({ error: "Unsupported event type" });
     }
 
-    // ------ إرسال الرسالة مع تحديث الحصة ------ //
+    // ------ إرسال الرسالة ------ //
     await sendSMS(phone, message);
-    sentCount++;
 
-    // ------ الرد الناجح مع بيانات الحصة ------ //
     return res.status(200).json({
       success: true,
       message: "SMS sent successfully",
-      quota: {
-        sent: sentCount,
-        remaining: MAX_QUOTA - sentCount,
-      },
+      remaining_quota: remainingQuota - 1,
     });
   } catch (error) {
     console.error("Webhook Error:", error);
@@ -74,6 +65,48 @@ module.exports = async (req, res) => {
 
 // ========== الدوال المساعدة ========== //
 
+function verifyHmac(hmacHeader, body) {
+  const secret = process.env.SHOPIFY_WEBHOOK_SECRET;
+  const generatedHash = crypto
+    .createHmac("sha256", secret)
+    .update(body)
+    .digest("base64");
+
+  return crypto.timingSafeEqual(
+    Buffer.from(generatedHash, "base64"),
+    Buffer.from(hmacHeader, "base64")
+  );
+}
+
+async function getRawBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("error", reject);
+  });
+}
+
+function extractPhoneNumber(data) {
+  return (
+    data?.customer?.phone ||
+    data?.order?.customer?.phone ||
+    data?.checkout?.billing_address?.phone
+  );
+}
+
+function createNotificationMessage(eventType, data) {
+  const orderNumber = data.order?.order_number || "N/A";
+
+  const messages = {
+    "orders/create": `📦 تم تأكيد طلبك #${orderNumber}! شكراً لاختيارك متجرنا`,
+    "orders/cancelled": `⚠️ نأسف لإلغاء طلبك #${orderNumber}. للاستفسار: ${process.env.STORE_CONTACT}`,
+    "orders/updated": `🔄 تم تحديث حالة طلبك #${orderNumber} إلى: ${data.order?.financial_status}`,
+  };
+
+  return messages[eventType];
+}
+
 async function checkCredit() {
   try {
     const response = await axios.post(process.env.CHECK_CREDIT_URL, {
@@ -81,23 +114,14 @@ async function checkCredit() {
       Password: process.env.SMS_PASSWORD,
     });
 
-    // معالجة الأكواد الخاصة بـ Community Ads
-    if (response.data === -5) {
-      throw new Error("الحصة نفذت");
-    }
-
+    if (response.data === -5) throw new Error("الحصة نفذت");
     return response.data;
   } catch (error) {
-    console.error("Credit Check Failed:", error);
-    throw error;
+    throw new Error(`فشل التحقق من الرصيد: ${error.message}`);
   }
 }
 
 async function sendSMS(phoneNumber, message) {
-  if (sentCount >= MAX_QUOTA) {
-    throw new Error("لقد وصلت إلى الحد الأقصى للرسائل");
-  }
-
   const payload = {
     UserName: process.env.SMS_USERNAME,
     Password: process.env.SMS_PASSWORD,
@@ -111,6 +135,6 @@ async function sendSMS(phoneNumber, message) {
   const response = await axios.post(process.env.SMS_API_URL, payload);
 
   if (response.data?.Status !== "Success") {
-    throw new Error(`فشل الإرسال: ${response.data}`);
+    throw new Error(`فشل إرسال الرسالة: ${JSON.stringify(response.data)}`);
   }
 }

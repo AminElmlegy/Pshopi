@@ -1,64 +1,92 @@
 const crypto = require("crypto");
 const axios = require("axios");
-require("dotenv").config();
 
 module.exports = async (req, res) => {
   try {
-    // ------ التحقق من طريقة الطلب ------ //
+    // ------ 1. التحقق الأساسي من نوع الطلب ------ //
     if (req.method !== "POST") {
-      return res.status(405).json({ error: "Method Not Allowed" });
+      console.warn("⚠️ Request method not allowed:", req.method);
+      return res.status(405).json({ error: "الطريقة غير مسموحة" });
     }
 
-    // ------ التحقق من الهيدرات الأساسية ------ //
-    const eventType = req.headers["x-shopify-topic"];
-    const shopDomain = req.headers["x-shopify-shop-domain"];
-    const hmacHeader = req.headers["x-shopify-hmac-sha256"];
+    // ------ 2. التحقق من الهيدرات الأساسية ------ //
+    const requiredHeaders = [
+      "x-shopify-topic",
+      "x-shopify-shop-domain",
+      "x-shopify-hmac-sha256",
+    ];
 
-    if (!eventType || !shopDomain || !hmacHeader) {
-      return res.status(401).json({ error: "Missing required headers" });
+    const missingHeaders = requiredHeaders.filter((h) => !req.headers[h]);
+    if (missingHeaders.length > 0) {
+      console.error("❌ Missing headers:", missingHeaders);
+      return res.status(401).json({ error: "هيدرات مطلوبة مفقودة" });
     }
 
-    // ------ قراءة البيانات الخام ------ //
+    // ------ 3. قراءة البيانات الخام ------ //
     const rawBody = await getRawBody(req);
+    console.log("✅ Received raw body:", rawBody.toString("utf8"));
 
-    // ------ التحقق من توقيع HMAC ------ //
-    if (!verifyHmac(hmacHeader, rawBody)) {
-      return res.status(401).json({ error: "Invalid HMAC signature" });
+    // ------ 4. التحقق من توقيع HMAC ------ //
+    const isValidHmac = verifyHmac(
+      req.headers["x-shopify-hmac-sha256"],
+      rawBody
+    );
+
+    if (!isValidHmac) {
+      console.error("❌ HMAC verification failed");
+      return res.status(401).json({ error: "توقيع غير صالح" });
     }
 
-    // ------ معالجة البيانات ------ //
+    // ------ 5. معالجة البيانات ------ //
     const webhookData = JSON.parse(rawBody.toString("utf8"));
+    console.log("📦 Webhook Data:", JSON.stringify(webhookData, null, 2));
+
     const phone = extractPhoneNumber(webhookData);
-
     if (!phone) {
-      return res.status(400).json({ error: "Phone number not found" });
+      console.error("📞 Phone number not found in data");
+      return res.status(400).json({ error: "رقم الهاتف غير موجود" });
     }
 
-    // ------ التحقق من الرصيد المتبقي ------ //
+    // ------ 6. التحقق من رصيد الرسائل ------ //
     const remainingQuota = await checkCredit();
+    console.log("💳 Remaining SMS quota:", remainingQuota);
+
     if (remainingQuota <= 0) {
-      return res.status(402).json({ error: "SMS quota exceeded" });
+      return res.status(402).json({ error: "نفاد الحصة المسموحة" });
     }
 
-    // ------ إنشاء الرسالة ------ //
-    const message = createNotificationMessage(eventType, webhookData);
+    // ------ 7. إنشاء محتوى الرسالة ------ //
+    const message = createNotificationMessage(
+      req.headers["x-shopify-topic"],
+      webhookData
+    );
+
     if (!message) {
-      return res.status(400).json({ error: "Unsupported event type" });
+      console.error(
+        "📭 Unsupported event type:",
+        req.headers["x-shopify-topic"]
+      );
+      return res.status(400).json({ error: "نوع الحدث غير مدعوم" });
     }
 
-    // ------ إرسال الرسالة ------ //
-    await sendSMS(phone, message);
+    // ------ 8. إرسال الرسالة النصية ------ //
+    console.log("🚀 Attempting to send SMS:", { phone, message });
+    const smsResponse = await sendSMS(phone, message);
+    console.log("📩 SMS sent successfully:", smsResponse);
 
-    return res.status(200).json({
+    // ------ 9. الرد النهائي ------ //
+    res.status(200).json({
       success: true,
-      message: "SMS sent successfully",
+      message: "تم إرسال الرسالة بنجاح",
       remaining_quota: remainingQuota - 1,
+      sms_id: smsResponse.SMSID,
     });
   } catch (error) {
-    console.error("Webhook Error:", error);
-    return res.status(500).json({
-      error: "Internal Server Error",
+    console.error("🔥 Critical Error:", error.stack);
+    res.status(500).json({
+      error: "خطأ داخلي",
       details: error.message,
+      ...(process.env.NODE_ENV === "development" && { stack: error.stack }),
     });
   }
 };
@@ -66,45 +94,70 @@ module.exports = async (req, res) => {
 // ========== الدوال المساعدة ========== //
 
 function verifyHmac(hmacHeader, body) {
-  const secret = process.env.SHOPIFY_WEBHOOK_SECRET;
-  const generatedHash = crypto
-    .createHmac("sha256", secret)
-    .update(body)
-    .digest("base64");
+  try {
+    const secret = process.env.SHOPIFY_WEBHOOK_SECRET;
+    if (!secret) throw new Error("SHOPIFY_WEBHOOK_SECRET غير موجود");
 
-  return crypto.timingSafeEqual(
-    Buffer.from(generatedHash, "base64"),
-    Buffer.from(hmacHeader, "base64")
-  );
+    const generatedHash = crypto
+      .createHmac("sha256", secret)
+      .update(body)
+      .digest("base64");
+
+    return crypto.timingSafeEqual(
+      Buffer.from(generatedHash, "base64"),
+      Buffer.from(hmacHeader, "base64")
+    );
+  } catch (error) {
+    console.error("🔐 HMAC Verification Error:", error);
+    return false;
+  }
 }
 
 async function getRawBody(req) {
   return new Promise((resolve, reject) => {
-    const chunks = [];
-    req.on("data", (chunk) => chunks.push(chunk));
-    req.on("end", () => resolve(Buffer.concat(chunks)));
-    req.on("error", reject);
+    let data = [];
+    req
+      .on("data", (chunk) => data.push(chunk))
+      .on("end", () => resolve(Buffer.concat(data)))
+      .on("error", reject);
   });
 }
 
 function extractPhoneNumber(data) {
-  return (
-    data?.customer?.phone ||
-    data?.order?.customer?.phone ||
-    data?.checkout?.billing_address?.phone
-  );
+  // تحسين البحث في الهيكل لاستخراج رقم الهاتف
+  const phonePaths = [
+    "customer.phone",
+    "order.customer.phone",
+    "checkout.billing_address.phone",
+    "billing_address.phone",
+    "shipping_address.phone",
+  ];
+
+  for (const path of phonePaths) {
+    const value = path.split(".").reduce((obj, key) => obj?.[key], data);
+    if (value && isValidPhone(value)) return value;
+  }
+
+  return null;
+}
+
+function isValidPhone(phone) {
+  const phoneRegex = /^\+?[0-9]{8,15}$/;
+  return phoneRegex.test(phone);
 }
 
 function createNotificationMessage(eventType, data) {
-  const orderNumber = data.order?.order_number || "N/A";
-
-  const messages = {
-    "orders/create": `📦 تم تأكيد طلبك #${orderNumber}! شكراً لاختيارك متجرنا`,
-    "orders/cancelled": `⚠️ نأسف لإلغاء طلبك #${orderNumber}. للاستفسار: ${process.env.STORE_CONTACT}`,
-    "orders/updated": `🔄 تم تحديث حالة طلبك #${orderNumber} إلى: ${data.order?.financial_status}`,
+  const templates = {
+    "orders/create": `📦 تم تأكيد طلبك #${data.order?.order_number}! شكراً لثقتك`,
+    "orders/cancelled": `⚠️ إلغاء الطلب #${
+      data.order?.order_number
+    }، للاستفسار: ${process.env.STORE_PHONE || ""}`,
+    "orders/updated": `🔄 تحديث حالة الطلب #${data.order?.order_number}: ${data.order?.financial_status}`,
+    "orders/paid": `💳 تم دفع طلبك #${data.order?.order_number}`,
+    "orders/fulfilled": `🚚 تم شحن طلبك #${data.order?.order_number}`,
   };
 
-  return messages[eventType];
+  return templates[eventType] || null;
 }
 
 async function checkCredit() {
@@ -114,27 +167,41 @@ async function checkCredit() {
       Password: process.env.SMS_PASSWORD,
     });
 
-    if (response.data === -5) throw new Error("الحصة نفذت");
+    if (typeof response.data !== "number") {
+      throw new Error("استجابة غير صالحة من خدمة الرسائل");
+    }
+
     return response.data;
   } catch (error) {
-    throw new Error(`فشل التحقق من الرصيد: ${error.message}`);
+    console.error(
+      "💸 Credit Check Failed:",
+      error.response?.data || error.message
+    );
+    throw new Error("فشل التحقق من الرصيد");
   }
 }
 
 async function sendSMS(phoneNumber, message) {
-  const payload = {
-    UserName: process.env.SMS_USERNAME,
-    Password: process.env.SMS_PASSWORD,
-    SMSText: message,
-    SMSLang: "ar",
-    SMSSender: process.env.SMS_SENDER,
-    SMSReceiver: phoneNumber,
-    SMSID: crypto.randomUUID(),
-  };
+  try {
+    const payload = {
+      UserName: process.env.SMS_USERNAME,
+      Password: process.env.SMS_PASSWORD,
+      SMSText: message,
+      SMSLang: "ar",
+      SMSSender: process.env.SMS_SENDER,
+      SMSReceiver: phoneNumber,
+      SMSID: crypto.randomUUID(),
+    };
 
-  const response = await axios.post(process.env.SMS_API_URL, payload);
+    const response = await axios.post(process.env.SMS_API_URL, payload);
 
-  if (response.data?.Status !== "Success") {
-    throw new Error(`فشل إرسال الرسالة: ${JSON.stringify(response.data)}`);
+    if (response.data?.Status !== "Success") {
+      throw new Error(JSON.stringify(response.data));
+    }
+
+    return response.data;
+  } catch (error) {
+    console.error("📴 SMS Send Error:", error.response?.data || error.message);
+    throw new Error("فشل إرسال الرسالة");
   }
 }

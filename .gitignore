@@ -1,0 +1,41 @@
+# ملفات النظام
+.DS_Store
+Thumbs.db
+
+# ملفات البيئة والمعلومات الحساسة
+.env
+.env.*
+!.env.example
+
+# تبعيات المشروع
+node_modules/
+
+# ملفات التسجيل والأخطاء
+*.log
+logs/
+npm-debug.log*
+
+# إعدادات بيئة التطوير
+.vscode/
+.idea/
+
+# ملفات البناء والتجميع
+dist/
+build/
+.coverage/
+.nyc_output/
+
+# ملفات الاختبارات
+test-results/
+
+# ملفات النظام المؤقتة
+*.tmp
+*.temp
+
+# ملفات النظام الخاصّة بأنظمة التشغيل
+ehthumbs.db
+Desktop.ini
+
+# ملفات Docker
+docker-compose.yml
+Dockerfile
